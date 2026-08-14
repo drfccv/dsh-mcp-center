@@ -1,0 +1,6 @@
+# dsh-mcp-center bundle patch: inserts its manager row into the profile.
+# Install with `dsh plugin --profile web add <path-or-git-url-or-npm-name>`;
+# the plugin then appears in Settings -> MCP Center.
+- insert:
+    - id: mcp-center
+      name: 'dsh-mcp-center'

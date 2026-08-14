@@ -1,0 +1,48 @@
+{
+  // Standalone package tsconfig. Deliberately does NOT extend
+  // ../../tsconfig.base.json: that facade maps every @deepseek-ai/dsh-* name
+  // to workspace SOURCE (.tsx / CSS / cross-package remote chains), which only
+  // compiles under the repo's per-package project-reference boundaries. This
+  // package resolves its client-side framework imports to the built rc.6
+  // .d.ts artifacts in $DSH_HOME/profiles/node_modules instead; skipLibCheck
+  // then skips their internals while the package's own code stays checked.
+  "compilerOptions": {
+    "target": "es2024",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "lib": ["es2024", "dom", "dom.iterable"],
+    "jsx": "react-jsx",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+    "verbatimModuleSyntax": false,
+    "declaration": false,
+    "noEmit": true,
+    "types": ["node"],
+    "ignoreDeprecations": "6.0",
+    "paths": {
+      "@deepseek-ai/cordis": ["C:/Users/YUAN LIU/.dsh/profiles/node_modules/@deepseek-ai/cordis/lib/types/index.d.ts"],
+      "@deepseek-ai/dsh-tools": ["C:/Users/YUAN LIU/.dsh/profiles/node_modules/@deepseek-ai/dsh-tools/lib/types/index.d.ts"],
+      "@deepseek-ai/dsh-host-webserver": ["C:/Users/YUAN LIU/.dsh/profiles/node_modules/@deepseek-ai/dsh-host-webserver/lib/types/index.d.ts"],
+      "@deepseek-ai/dsh-llm": ["C:/Users/YUAN LIU/.dsh/profiles/node_modules/@deepseek-ai/dsh-llm/lib/types/index.d.ts"],
+      "react": ["C:/Users/YUAN LIU/.dsh/profiles/node_modules/@types/react/index.d.ts"],
+      "react/jsx-runtime": ["C:/Users/YUAN LIU/.dsh/profiles/node_modules/@types/react/jsx-runtime.d.ts"],
+      "@deepseek-ai/dsh-client-ui-slots": ["C:/Users/YUAN LIU/.dsh/profiles/node_modules/@deepseek-ai/dsh-client-ui-slots/lib/types/index.d.ts"],
+      "@deepseek-ai/dsh-client-runtime": ["C:/Users/YUAN LIU/.dsh/profiles/node_modules/@deepseek-ai/dsh-client-runtime/lib/types/index.d.ts"],
+      "@deepseek-ai/dsh-client-runtime/client": ["C:/Users/YUAN LIU/.dsh/profiles/node_modules/@deepseek-ai/dsh-client-runtime/lib/types/client/index.d.ts"],
+      "@deepseek-ai/dsh-client-ui-settings": ["C:/Users/YUAN LIU/.dsh/profiles/node_modules/@deepseek-ai/dsh-client-ui-settings/lib/types/index.d.ts"],
+      "@deepseek-ai/dsh-client-ui-settings/client": ["C:/Users/YUAN LIU/.dsh/profiles/node_modules/@deepseek-ai/dsh-client-ui-settings/lib/types/client/index.d.ts"],
+      "@deepseek-ai/dsh-client-locale": ["C:/Users/YUAN LIU/.dsh/profiles/node_modules/@deepseek-ai/dsh-client-locale/lib/types/index.d.ts"],
+      "@deepseek-ai/dsh-client-locale/client": ["C:/Users/YUAN LIU/.dsh/profiles/node_modules/@deepseek-ai/dsh-client-locale/lib/types/client/index.d.ts"]
+    }
+  },
+  "include": ["src", "tsdown.config.ts"]
+}

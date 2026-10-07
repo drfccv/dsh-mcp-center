@@ -1,6 +1,6 @@
 {
   "name": "dsh-mcp-center",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "MCP Center: a settings-driven MCP server manager for the DeepSeek Harness. Register Streamable HTTP (no-auth / Bearer token / custom headers) or local stdio MCP servers from a dedicated Settings page; their tools publish as mcp__<name>__<tool> to the model. Self-contained MCP client, no external MCP SDK dependency.",
   "type": "module",
   "main": "lib/index.js",

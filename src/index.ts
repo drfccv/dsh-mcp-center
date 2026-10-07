@@ -385,12 +385,16 @@ export function apply(ctx: Context, config: { statePath?: string } = {}): void {
     method: string,
     params: unknown,
     conn: { sessionId: string | null },
-    { isNotification = false }: { isNotification?: boolean } = {},
+    { isNotification = false, retryOnExpired = true }: { isNotification?: boolean; retryOnExpired?: boolean } = {},
   ): Promise<unknown> {
     const payload: Record<string, unknown> = { jsonrpc: '2.0', method }
     if (params !== undefined) payload.params = params
     if (!isNotification) payload.id = rpcSeq++
     const resp = await httpPostJson(server.url ?? '', buildHeaders(server, conn), payload)
+    if (resp.status === 404 && retryOnExpired && conn.sessionId) {
+      await reinitializeSession(server, conn)
+      return mcpRpc(server, method, params, conn, { isNotification, retryOnExpired: false })
+    }
     if (resp.status >= 400) {
       throw new Error(`MCP ${method} HTTP ${resp.status}: ${String(resp.text).slice(0, 200)}`)
     }
@@ -444,7 +448,16 @@ export function apply(ctx: Context, config: { statePath?: string } = {}): void {
     ctx.logger.info(`mcp-center: ${server.name} connected, ${tools.length} tools`)
   }
 
-  async function connectHttp(server: ServerConfig, conn: LiveConn): Promise<void> {
+  /**
+   * Run the HTTP initialize handshake on `conn`, discarding any session id it
+   * already holds: an id the server no longer recognizes is what triggers
+   * recovery, so resending it would fail again. Shared by the initial connect
+   * and by `mcpRpc`'s recovery from an expired session.
+   *
+   * @param server - the HTTP server entry to handshake with.
+   * @param conn - the live connection whose sessionId is replaced.
+   */
+  async function reinitializeSession(server: ServerConfig, conn: { sessionId: string | null }): Promise<void> {
     const initPayload = {
       jsonrpc: '2.0',
       id: rpcSeq++,
@@ -455,6 +468,7 @@ export function apply(ctx: Context, config: { statePath?: string } = {}): void {
         clientInfo: { name: 'dsh-mcp-center', version: '0.1.0' },
       },
     }
+    conn.sessionId = null
     const resp = await httpPostJson(server.url ?? '', buildHeaders(server, conn), initPayload)
     if (resp.status >= 400) {
       throw new Error(`initialize HTTP ${resp.status}: ${String(resp.text).slice(0, 200)}`)
@@ -465,7 +479,14 @@ export function apply(ctx: Context, config: { statePath?: string } = {}): void {
     }
     const sid = resp.headers?.get?.('mcp-session-id')
     conn.sessionId = sid ?? null
-    await mcpRpc(server, 'notifications/initialized', undefined, conn, { isNotification: true }).catch(() => {})
+    await mcpRpc(server, 'notifications/initialized', undefined, conn, {
+      isNotification: true,
+      retryOnExpired: false,
+    }).catch(() => {})
+  }
+
+  async function connectHttp(server: ServerConfig, conn: LiveConn): Promise<void> {
+    await reinitializeSession(server, conn)
     const listed = (await mcpRpc(server, 'tools/list', {}, conn)) as {
       tools?: Array<{ name?: string; description?: string; inputSchema?: unknown }>
     } | null
@@ -493,10 +514,26 @@ export function apply(ctx: Context, config: { statePath?: string } = {}): void {
   }
 
   async function connect(server: ServerConfig): Promise<void> {
-    // Create ONE conn and register it in the live map BEFORE any async work,
-    // so every later mutation (registerTools, disconnect) touches the SAME
-    // object whose tools map carries the disposers.
-    const conn: LiveConn = {
+    // Reuse ONE conn object per server and register it BEFORE any async work, so
+    // every later mutation (registerTools, disconnect) touches the same object
+    // whose tools map carries the disposers. Reconnecting an already-live server
+    // therefore releases the previous registration first: its disposers would
+    // otherwise stay registered and refuse the replacement as a duplicate tool
+    // name, leaving the only repair action unable to recover the server.
+    const previous = live.get(server.id)
+    if (previous) {
+      for (const dispose of previous.tools.values()) {
+        try {
+          dispose()
+        } catch {}
+      }
+      previous.tools = new Map<string, () => void>()
+      previous.toolCount = 0
+      try {
+        previous.transport?.close?.()
+      } catch {}
+    }
+    const conn: LiveConn = previous ?? {
       sessionId: null,
       transport: null,
       tools: new Map<string, () => void>(),

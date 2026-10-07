@@ -27,6 +27,7 @@ import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 import { spawn } from 'node:child_process'
+import { createRequire } from 'node:module'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Context } from '@deepseek-ai/cordis'
 // Type-only: pulls the tools service's Context merge (ctx.tools) and the
@@ -39,6 +40,11 @@ import type {} from '@deepseek-ai/dsh-host-webserver'
 /** State file: server configs (no secrets beyond user-supplied tokens). */
 const DEFAULT_STATE_PATH = join(homedir(), '.dsh', 'mcp-center.json')
 const API_PREFIX = '/mcp-center/api'
+
+// The package's own manifest is the single source of the client version reported
+// in the MCP handshake, so it cannot drift from what is published (the relative
+// path resolves from both `src/` and the bundled `lib/`).
+const { version: VERSION } = createRequire(import.meta.url)('../package.json') as { version: string }
 
 /** Public tool-name namespace prefix, matching the dsh-mcp-client convention. */
 const SERVER_NAME_PATTERN = /^[A-Za-z0-9_-]{1,32}$/
@@ -465,7 +471,7 @@ export function apply(ctx: Context, config: { statePath?: string } = {}): void {
       params: {
         protocolVersion: '2025-03-26',
         capabilities: {},
-        clientInfo: { name: 'dsh-mcp-center', version: '0.1.0' },
+        clientInfo: { name: 'dsh-mcp-center', version: VERSION },
       },
     }
     conn.sessionId = null
@@ -503,7 +509,7 @@ export function apply(ctx: Context, config: { statePath?: string } = {}): void {
     await transport.request('initialize', {
       protocolVersion: '2025-03-26',
       capabilities: {},
-      clientInfo: { name: 'dsh-mcp-center', version: '0.1.0' },
+      clientInfo: { name: 'dsh-mcp-center', version: VERSION },
     })
     transport.notify('notifications/initialized')
     const listed = (await transport.request('tools/list', {})) as {

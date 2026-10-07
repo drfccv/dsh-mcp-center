@@ -78,15 +78,17 @@ Server configs live in `~/.dsh/mcp-center.json`:
 |---|---|
 | Settings page | `settings.section` slot entry (MCP Center tab) |
 | API | Same-origin JSON under `/mcp-center/api/*` (ping, servers CRUD, connect, enabled) |
-| HTTP transport | Streamable HTTP: JSON-RPC over POST, `Mcp-Session-Id`, JSON or SSE responses |
+| HTTP transport | Streamable HTTP: JSON-RPC over POST, `Mcp-Session-Id`, JSON or SSE responses (each SSE frame is parsed separately, so one stream may carry several messages) |
 | stdio transport | `child_process.spawn` a local command, JSON-RPC over stdin/stdout (newline-delimited); reconnect reaps the old process first |
 | Tool schema | Server JSON Schemas sanitized to the registry's supported raw subset (unsupported vocabulary degrades to unconstrained) |
-| State | `~/.dsh/mcp-center.json` |
+| State | `~/.dsh/mcp-center.json`, written atomically with owner-only permissions |
 
 ## Current limitations
 
 - Only `tools` are bridged; `resources` and `prompts` MCP capabilities are not.
-- Bearer tokens live in a plain JSON file under `~/.dsh` — treat it as a secret.
+- Bearer tokens and custom auth headers live in the state file under `~/.dsh`, in plain text under owner-only permissions — treat it as a secret.
+- A config that exists but cannot be parsed fails the plugin load instead of starting with no servers, because the next save would otherwise overwrite that file and lose every stored server.
+- Request bodies are capped at 1 MiB (answered as 413) and one stdio server's undecoded stdout at 4 MiB; exceeding the latter fails that server's pending calls and stops its process.
 - stdio servers run as long-lived child processes tied to the plugin lifecycle; `args` are whitespace-tokenized (quotes protect args with spaces) with no shell expansion — write absolute paths or env vars yourself for `~`, `$VAR`, pipes, etc.
 - No automatic reconnect after a crash in this version; re-enable or restart the server to reconnect.
 

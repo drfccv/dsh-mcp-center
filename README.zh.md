@@ -78,15 +78,17 @@ mcp__web__ping    mcp__web__shout
 |---|---|
 | 设置页 | `settings.section` 槽条目（MCP Center 页） |
 | API | `/mcp-center/api/*` 下的同源 JSON（ping、服务器增删改查、connect、enabled） |
-| HTTP 传输 | Streamable HTTP：POST 上的 JSON-RPC，`Mcp-Session-Id`，JSON 或 SSE 响应 |
+| HTTP 传输 | Streamable HTTP：POST 上的 JSON-RPC，`Mcp-Session-Id`，JSON 或 SSE 响应（逐个 SSE 帧解析，因此一个流可承载多条消息） |
 | stdio 传输 | `child_process.spawn` 本地命令，stdin/stdout 上的 JSON-RPC（换行分隔）；重连先回收旧进程 |
 | 工具 schema | 服务器 JSON Schema 清洗为注册表支持的原始子集（不支持的词汇降级为无约束） |
-| 状态 | `~/.dsh/mcp-center.json` |
+| 状态 | `~/.dsh/mcp-center.json`，原子写入且仅所有者可读写 |
 
 ## 当前限制
 
 - 仅桥接 tools，不提供 `resources` / `prompts` 能力。
-- Bearer Token 存放在 `~/.dsh` 下的纯 JSON 文件中——请视为机密。
+- Bearer Token 与自定义认证头以明文存放在 `~/.dsh` 下的状态文件中，权限仅所有者可读写——请视为机密。
+- 配置存在但无法解析时，插件加载会失败，而不是以「零服务器」启动：否则下一次保存会覆盖该文件并丢失全部已存服务器。
+- 请求体上限 1 MiB（超出返回 413），单个 stdio 服务器未解码的 stdout 上限 4 MiB；超出后者会使其待处理调用失败并停止该进程。
 - stdio 服务器是与插件生命周期绑定的长驻子进程；`args` 按空白分词（含空格的参数用引号包住），不做 shell 展开——`~`、`$VAR`、管道等请自行写成绝对路径或环境变量。
 - 本版本没有崩溃后自动重连；重新启用或重启服务器即可重连。
 

@@ -23,7 +23,7 @@
  */
 
 import { createHash, randomBytes } from 'node:crypto'
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdirSync, renameSync, rmSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 import { spawn } from 'node:child_process'
@@ -49,6 +49,22 @@ const { version: VERSION } = createRequire(import.meta.url)('../package.json') a
 /** Public tool-name namespace prefix, matching the dsh-mcp-client convention. */
 const SERVER_NAME_PATTERN = /^[A-Za-z0-9_-]{1,32}$/
 
+/**
+ * Cap on one API request body. The payload is a short JSON document describing
+ * servers (including env maps and auth headers), so 1 MiB is far above any
+ * legitimate value while keeping an oversized or hostile body from being
+ * buffered into memory; the API answers 413 beyond it.
+ */
+const MAX_BODY_BYTES = 1 << 20
+
+/**
+ * Cap on the undecoded stdout held for one stdio server. A well-behaved peer
+ * writes newline-delimited messages, so this only trips when a peer emits a
+ * single message with no newline, or floods without finishing one; the
+ * transport then fails instead of growing without bound.
+ */
+const MAX_STDIO_BUFFER_BYTES = 4 << 20
+
 interface ServerConfig {
   id: string
   name: string
@@ -71,17 +87,82 @@ interface State {
   servers: ServerConfig[]
 }
 
-function loadState(statePath: string): State {
-  try {
-    return JSON.parse(readFileSync(statePath, 'utf8')) as State
-  } catch {
-    return { servers: [] }
+/** User-private permissions for the config file, which holds bearer tokens and auth headers. */
+const STATE_FILE_MODE = 0o600
+
+/** Thrown when a request body exceeds {@link MAX_BODY_BYTES}, so the API can answer 413. */
+class PayloadTooLargeError extends Error {
+  /** Byte length observed when the limit was exceeded. */
+  readonly size: number
+
+  /**
+   * @param size - bytes seen before the read was abandoned.
+   */
+  constructor(size: number) {
+    super(`request body exceeds ${MAX_BODY_BYTES} bytes`)
+    this.name = 'PayloadTooLargeError'
+    this.size = size
   }
 }
 
+/** Whether a filesystem error means the path simply does not exist yet. */
+function isEnoent(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException | null)?.code === 'ENOENT'
+}
+
+/**
+ * Read the server list. A missing file is first-run, not a failure. Anything
+ * else — unreadable, or present but unparseable — throws instead of reporting
+ * an empty list: the API saves that empty list on the next mutation, so
+ * treating corruption as "no servers" would silently destroy every server
+ * config rather than surface the problem.
+ *
+ * @param statePath - path of the JSON state document.
+ * @returns the stored servers.
+ */
+function loadState(statePath: string): State {
+  let text: string
+  try {
+    text = readFileSync(statePath, 'utf8')
+  } catch (error) {
+    if (isEnoent(error)) return { servers: [] }
+    throw error
+  }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch (error) {
+    throw new Error(`${statePath} is not valid JSON: ${error instanceof Error ? error.message : String(error)}`)
+  }
+  const servers = isPlainObj(parsed) ? parsed.servers : undefined
+  if (!Array.isArray(servers)) throw new Error(`${statePath} does not contain a "servers" array`)
+  return { servers: servers.filter(isPlainObj) as unknown as ServerConfig[] }
+}
+
+/**
+ * Replace the state document in one atomic step. The content goes to a
+ * random-suffix sibling opened with exclusive create, then renames over the
+ * target, so a reader — including the next DSH boot — sees either the whole
+ * old document or the whole new one, and a crash mid-write cannot leave
+ * truncated JSON behind. The fresh inode also carries {@link STATE_FILE_MODE}
+ * through the rename, tightening a wider mode left by earlier versions without
+ * a chmod race.
+ *
+ * @param statePath - path of the JSON state document.
+ * @param state - complete next state.
+ */
 function saveState(statePath: string, state: State): void {
   mkdirSync(dirname(statePath), { recursive: true })
-  writeFileSync(statePath, JSON.stringify(state, null, 2))
+  const temp = `${statePath}.${randomBytes(6).toString('hex')}.tmp`
+  try {
+    writeFileSync(temp, JSON.stringify(state, null, 2), { mode: STATE_FILE_MODE, flag: 'wx' })
+    renameSync(temp, statePath)
+  } catch (error) {
+    try {
+      rmSync(temp, { force: true })
+    } catch {}
+    throw error
+  }
 }
 
 /** Base64url helper. */
@@ -135,20 +216,50 @@ function parseBody(resp: HttpResp): unknown {
   }
 }
 
-/** Parse a JSON-RPC response body, including an SSE `data:` payload fallback. */
-function parseRpc(resp: HttpResp): unknown {
-  let parsed = parseBody(resp)
-  if (!parsed) {
-    const data = resp.text
-      .split('\n')
+/**
+ * Parse a Streamable HTTP response body. A server may answer a JSON-RPC request
+ * with either an `application/json` document or an SSE stream of
+ * `event: message` frames, so this resolves the JSON-RPC message the caller is
+ * waiting for: the stream is split on blank-line frame boundaries and each
+ * frame's `data:` payload is parsed on its own. Concatenating every `data:` line
+ * would instead yield invalid JSON as soon as one stream carried more than one
+ * frame.
+ *
+ * A frame's own value is returned as-is, so a non-object payload (a batch
+ * array, or a bare scalar) still reaches the caller rather than being dropped.
+ *
+ * @param resp - the completed HTTP response.
+ * @param id - the JSON-RPC id to resolve from a frame, when the caller sent one.
+ * @returns the matching message value, or `null` when no frame parses.
+ */
+function parseRpc(resp: HttpResp, id?: number): unknown {
+  const direct = parseBody(resp)
+  if (direct !== null) return direct
+  const frames = resp.text.split(/\r?\n\r?\n/)
+  let firstParsed: unknown = null
+  let sawParsed = false
+  for (const frame of frames) {
+    const data = frame
+      .split(/\r?\n/)
       .filter((line) => line.startsWith('data:'))
       .map((line) => line.slice(5).trim())
       .join('\n')
+    if (!data) continue
+    let value: unknown
     try {
-      parsed = JSON.parse(data)
-    } catch {}
+      value = JSON.parse(data)
+    } catch {
+      continue
+    }
+    if (!sawParsed) {
+      firstParsed = value
+      sawParsed = true
+    }
+    // A server may interleave notifications with the reply, so keep looking for
+    // the frame carrying this request's id before settling for the first one.
+    if (id !== undefined && isPlainObj(value) && value.id === id) return value
   }
-  return parsed
+  return sawParsed ? firstParsed : null
 }
 
 // ---------- stdio transport ----------
@@ -219,6 +330,9 @@ function spawnStdio(server: ServerConfig): StdioTransport {
       }
       // server→client notifications (no id) are ignored
     }
+    if (buffer.length > MAX_STDIO_BUFFER_BYTES) {
+      failAndKill(new Error(`stdio endpoint sent more than ${MAX_STDIO_BUFFER_BYTES} bytes without a newline`))
+    }
   })
   child.stderr.on('data', (chunk: Buffer) => {
     stderrTail = (stderrTail + chunk.toString('utf8')).slice(-2000)
@@ -231,6 +345,15 @@ function spawnStdio(server: ServerConfig): StdioTransport {
       p.reject(error)
     }
     pending.clear()
+  }
+  // A transport-level failure leaves the peer unusable, so stop the process
+  // too; the `close`/`error` handlers then observe `closed` and stay silent.
+  const failAndKill = (error: Error): void => {
+    if (closed) return
+    fail(error)
+    try {
+      child.kill()
+    } catch {}
   }
   child.on('error', fail)
   child.on('close', () => {
@@ -363,12 +486,23 @@ interface LiveConn {
 
 /**
  * Mount the manager: load state, register the HTTP API, auto-connect servers.
+ *
+ * A config file that exists but cannot be understood fails the plugin load
+ * rather than being ignored: continuing with an empty list would write that
+ * empty list back on the next mutation and lose every stored server.
+ *
  * @param ctx - plugin context carrying tools (and webServer when mounted).
  * @param config - resolved plugin configuration.
  */
 export function apply(ctx: Context, config: { statePath?: string } = {}): void {
   const statePath = config.statePath ?? DEFAULT_STATE_PATH
-  const state = loadState(statePath)
+  let state: State
+  try {
+    state = loadState(statePath)
+  } catch (error) {
+    ctx.logger.error(`mcp-center: cannot read ${statePath}: ${error instanceof Error ? error.message : String(error)}`)
+    throw error
+  }
   const live = new Map<string, LiveConn>()
   let rpcSeq = 1
 
@@ -405,7 +539,7 @@ export function apply(ctx: Context, config: { statePath?: string } = {}): void {
       throw new Error(`MCP ${method} HTTP ${resp.status}: ${String(resp.text).slice(0, 200)}`)
     }
     if (isNotification) return null
-    const parsed = parseRpc(resp)
+    const parsed = parseRpc(resp, payload.id as number)
     if (!parsed) throw new Error(`MCP ${method}: non-JSON response`)
     if (isPlainObj(parsed) && parsed.error) {
       throw new Error(
@@ -479,7 +613,7 @@ export function apply(ctx: Context, config: { statePath?: string } = {}): void {
     if (resp.status >= 400) {
       throw new Error(`initialize HTTP ${resp.status}: ${String(resp.text).slice(0, 200)}`)
     }
-    const init = parseRpc(resp)
+    const init = parseRpc(resp, initPayload.id)
     if (!init || (isPlainObj(init) && init.error)) {
       throw new Error(`initialize failed: ${String(resp.text).slice(0, 200)}`)
     }
@@ -613,9 +747,28 @@ export function apply(ctx: Context, config: { statePath?: string } = {}): void {
     res.end(JSON.stringify(value))
   }
 
+  /**
+   * Read a JSON request body, refusing anything over {@link MAX_BODY_BYTES}.
+   * A declared `Content-Length` over the limit is rejected before the first
+   * byte is buffered; a chunked body without one is bounded as it arrives. A
+   * body that is not JSON reads as `{}`, which each route then reports through
+   * its own field-level validation.
+   *
+   * @param req - the incoming request.
+   * @returns the parsed body.
+   * @throws PayloadTooLargeError when the body exceeds the cap.
+   */
   async function readBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+    const declared = Number(req.headers?.['content-length'] ?? Number.NaN)
+    if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) throw new PayloadTooLargeError(declared)
     const chunks: Buffer[] = []
-    for await (const chunk of req) chunks.push(Buffer.from(chunk))
+    let total = 0
+    for await (const chunk of req) {
+      const buf = Buffer.from(chunk as Buffer)
+      total += buf.length
+      if (total > MAX_BODY_BYTES) throw new PayloadTooLargeError(total)
+      chunks.push(buf)
+    }
     try {
       return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}') as Record<string, unknown>
     } catch {
@@ -787,6 +940,13 @@ export function apply(ctx: Context, config: { statePath?: string } = {}): void {
         res.writeHead(404)
         res.end()
       } catch (error) {
+        // An oversized body is a client fault the caller can act on, so it is
+        // answered as 413 rather than the generic 500.
+        if (error instanceof PayloadTooLargeError) {
+          ctx.logger.warn(`mcp-center api: rejected ${error.size}-byte body over ${MAX_BODY_BYTES} bytes`)
+          json(res, 413, { code: 'payload-too-large', error: error.message })
+          return
+        }
         ctx.logger.error(`mcp-center api: ${error instanceof Error ? error.stack : String(error)}`)
         json(res, 500, {
           code: 'internal',

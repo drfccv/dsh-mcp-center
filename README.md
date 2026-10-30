@@ -43,7 +43,7 @@ Restart `dsh web`, open **Settings → MCP Center**, and click **＋ Add MCP ser
 
 ### 3. Save — and it's connected
 
-The server connects as soon as you save. Status badges show `Connected (N tools)` / `Connecting` / `Error` / `Disabled`. Per server you can enable/disable, delete, and (for Bearer servers) re-token.
+The server connects as soon as you save. Status badges show `Connected (N tools)` / `Connecting` / `Error` / `Disabled`. Each server can be edited in place, enabled/disabled, or deleted: **Edit** expands the same form, so you can change the name, URL or stdio command/args/env, and the auth mode without re-creating the server. For Bearer servers a blank token keeps the stored one, and saving reconnects with the new config.
 
 ### The model can use it right away
 

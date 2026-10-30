@@ -732,10 +732,18 @@ export function apply(ctx: Context, config: { statePath?: string } = {}): void {
     if (server.type === 'stdio') {
       view.command = server.command
       view.args = server.args ?? []
+      // env is editable state, so it is returned; the settings page renders it
+      // as JSON and sends it back on save.
+      view.env = server.env ?? {}
       view.cwd = server.cwd ?? ''
     } else {
       view.url = server.url
       view.authMode = server.authMode ?? 'none'
+      // Custom headers are editable state and therefore returned. The Bearer
+      // token is NOT: it is write-only, and `hasToken` only tells the edit form
+      // whether a blank token field would keep an existing secret.
+      view.headers = server.headers ?? {}
+      view.hasToken = Boolean(server.token)
     }
     return view
   }
@@ -824,6 +832,75 @@ export function apply(ctx: Context, config: { statePath?: string } = {}): void {
     return {}
   }
 
+  /**
+   * Validate one create/update payload and build the stored entry. Shared by
+   * `POST /servers` and `PUT /servers/:id`, so both transports enforce exactly
+   * the same field rules.
+   *
+   * `previous` is the entry an update replaces: its id is kept, its disabled
+   * flag survives an edit (so editing a dormant server never connects it), and
+   * a bearer token omitted from the payload is carried over instead of erased.
+   *
+   * @param body - parsed request body.
+   * @param name - already name-pattern-checked server name.
+   * @param type - requested transport.
+   * @param id - id for the resulting entry (fresh for create, existing for update).
+   * @param previous - entry being replaced on update.
+   * @returns the entry to store, or an API error payload.
+   */
+  function buildServer(
+    body: Record<string, unknown>,
+    name: string,
+    type: 'http' | 'stdio',
+    id: string,
+    previous?: ServerConfig,
+  ): { server: ServerConfig } | { code: string; error: string } {
+    const disabled = previous?.enabled === false
+    if (type === 'stdio') {
+      const command = String(body.command ?? '').trim()
+      if (!command) {
+        return {
+          code: 'command-required',
+          error: 'stdio server requires a command (executable, e.g. npx / uvx / python)',
+        }
+      }
+      const server: ServerConfig = {
+        id,
+        name,
+        type: 'stdio',
+        command,
+        args: parseArgs(body.args),
+        env: parseEnv(body.env),
+      }
+      const cwd = String(body.cwd ?? '').trim()
+      if (cwd) server.cwd = cwd
+      if (disabled) server.enabled = false
+      return { server }
+    }
+    const serverUrl = String(body.url ?? '').trim()
+    if (!/^https?:\/\//.test(serverUrl)) {
+      return { code: 'url-invalid', error: 'url must be an http(s) URL' }
+    }
+    const authMode = body.authMode === 'bearer' || body.authMode === 'headers' ? body.authMode : 'none'
+    const server: ServerConfig = {
+      id,
+      name,
+      type: 'http',
+      url: serverUrl,
+      authMode,
+    }
+    if (authMode === 'bearer') {
+      // A blank token on edit means "keep the stored secret"; switching a
+      // non-bearer server to bearer with no token starts without one.
+      const supplied = typeof body.token === 'string' ? body.token : ''
+      const carried = previous?.type === 'http' && previous.authMode === 'bearer' ? previous.token : undefined
+      server.token = supplied !== '' ? supplied : (carried ?? '')
+    }
+    if (authMode === 'headers') server.headers = parseHeaders(body.headers)
+    if (disabled) server.enabled = false
+    return { server }
+  }
+
   const route = ctx.webServer.register({
     kind: 'prefix',
     path: '/mcp-center',
@@ -858,47 +935,13 @@ export function apply(ctx: Context, config: { statePath?: string } = {}): void {
           if (state.servers.some((s) => s.name === name)) {
             return json(res, 409, { code: 'name-exists', error: `a server named ${name} already exists` })
           }
+          const built = buildServer(body, name, type, b64url(randomBytes(8)))
+          if ('code' in built) return json(res, 400, built)
 
-          let server: ServerConfig
-          if (type === 'stdio') {
-            const command = String(body.command ?? '').trim()
-            if (!command) {
-              return json(res, 400, {
-                code: 'command-required',
-                error: 'stdio server requires a command (executable, e.g. npx / uvx / python)',
-              })
-            }
-            server = {
-              id: b64url(randomBytes(8)),
-              name,
-              type: 'stdio',
-              command,
-              args: parseArgs(body.args),
-              env: parseEnv(body.env),
-            }
-            const cwd = String(body.cwd ?? '').trim()
-            if (cwd) server.cwd = cwd
-          } else {
-            const serverUrl = String(body.url ?? '').trim()
-            const authMode = body.authMode === 'bearer' || body.authMode === 'headers' ? body.authMode : 'none'
-            if (!/^https?:\/\//.test(serverUrl)) {
-              return json(res, 400, { code: 'url-invalid', error: 'url must be an http(s) URL' })
-            }
-            server = {
-              id: b64url(randomBytes(8)),
-              name,
-              type: 'http',
-              url: serverUrl,
-              authMode,
-            }
-            if (authMode === 'bearer') server.token = String(body.token ?? '')
-            if (authMode === 'headers') server.headers = parseHeaders(body.headers)
-          }
-
-          state.servers.push(server)
+          state.servers.push(built.server)
           saveState(statePath, state)
-          await connect(server)
-          return json(res, 201, { server: serverView(server) })
+          await connect(built.server)
+          return json(res, 201, { server: serverView(built.server) })
         }
         if (idMatch) {
           const server = state.servers.find((s) => s.id === idMatch[1])
@@ -929,6 +972,33 @@ export function apply(ctx: Context, config: { statePath?: string } = {}): void {
               await connect(server)
             }
             return json(res, 200, { server: serverView(server) })
+          }
+          if (req.method === 'PUT' && !action) {
+            const body = await readBody(req)
+            const name = String(body.name ?? '').trim()
+            const type = body.type === 'stdio' ? 'stdio' : 'http'
+            if (!SERVER_NAME_PATTERN.test(name)) {
+              return json(res, 400, {
+                code: 'name-invalid',
+                error: 'name must be 1-32 chars of [A-Za-z0-9_-] (it becomes the mcp__<name>__ tool prefix)',
+              })
+            }
+            if (state.servers.some((s) => s.name === name && s.id !== server.id)) {
+              return json(res, 409, { code: 'name-exists', error: `a server named ${name} already exists` })
+            }
+            const built = buildServer(body, name, type, server.id, server)
+            if ('code' in built) return json(res, 400, built)
+            const next = built.server
+            // Replace in place so the settings list keeps its order; an edit
+            // reconnects only an enabled server (a disabled one stays dormant).
+            state.servers[state.servers.indexOf(server)] = next
+            saveState(statePath, state)
+            if (next.enabled === false) {
+              disconnect(next.id)
+            } else {
+              await connect(next)
+            }
+            return json(res, 200, { server: serverView(next) })
           }
           if (req.method === 'DELETE' && !action) {
             disconnect(server.id)

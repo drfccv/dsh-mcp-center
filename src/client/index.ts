@@ -81,6 +81,16 @@ export function apply(ctx: Context): void {
       if (!resp.ok) throw new Error(hostError(body, 'addError', { status: resp.status, name: payload.name }))
       return body.server
     },
+    updateServer: async (id, payload) => {
+      const resp = await fetch(`/mcp-center/api/servers/${id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+      const body = await resp.json().catch(() => ({}))
+      if (!resp.ok) throw new Error(hostError(body, 'updateError', { status: resp.status, name: payload.name }))
+      return body.server
+    },
     removeServer: async (id) => {
       const resp = await fetch(`/mcp-center/api/servers/${id}`, { method: 'DELETE' })
       const body = await resp.json().catch(() => ({}))

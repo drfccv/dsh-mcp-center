@@ -1,6 +1,6 @@
 /**
- * MCP Center settings section: the managed server list with add / delete /
- * enable/disable forms. The UI talks to the node half's same-origin JSON API
+ * MCP Center settings section: the managed server list with add / edit / delete
+ * / enable/disable forms. The UI talks to the node half's same-origin JSON API
  * through the inject face; the node half persists each change and connects
  * immediately.
  *
@@ -26,13 +26,20 @@ export interface McpServerView {
   authMode?: string
   command?: string
   args?: string[]
+  /** stdio env (returned so the edit form can round-trip it). */
+  env?: Record<string, string>
   cwd?: string
+  /** HTTP custom headers (returned so the edit form can round-trip them). */
+  headers?: Record<string, string>
+  /** Whether a Bearer token is stored; the token itself is never returned. */
+  hasToken?: boolean
 }
 
 /** Registration-side business face for the MCP Center section. */
 export interface McpCenterSectionInjected {
   loadServers: () => Promise<McpServerView[]>
   addServer: (payload: Record<string, unknown>) => Promise<McpServerView>
+  updateServer: (id: string, payload: Record<string, unknown>) => Promise<McpServerView>
   removeServer: (id: string) => Promise<void>
   toggleServer: (id: string, enabled: boolean) => Promise<void>
   reconnectServer: (id: string, token?: string) => Promise<McpServerView>
@@ -47,12 +54,13 @@ export type McpCenterSectionProps =
 /** Translate function bound to the mcp-center namespace. */
 export type McpCenterTranslate = TranslateNS<'mcp-center'>
 
-/** Add-form local state. */
-interface AddDraft {
+/** Editable form state shared by the add and edit forms. */
+interface ServerDraft {
   type: 'http' | 'stdio'
   name: string
   url: string
   authMode: 'none' | 'bearer' | 'headers'
+  /** Write-only: blank when editing keeps the stored token. */
   token: string
   headersText: string
   command: string
@@ -61,7 +69,10 @@ interface AddDraft {
   cwd: string
 }
 
-function freshDraft(): AddDraft {
+/** A server name doubles as the `mcp__<name>__` tool prefix. */
+const NAME_PATTERN = /^[A-Za-z0-9_-]{1,32}$/
+
+function freshDraft(): ServerDraft {
   return {
     type: 'http',
     name: '',
@@ -292,7 +303,60 @@ function parseRecord(text: string): Record<string, string> {
   }
 }
 
-/** Server-list row: name, endpoint, status, actions. */
+/** Whether `text` is blank or parses to a JSON object (the env/headers field contract). */
+function isRecordText(text: string): boolean {
+  if (text.trim() === '') return true
+  try {
+    const parsed: unknown = JSON.parse(text)
+    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
+  } catch {
+    return false
+  }
+}
+
+/** Render argv back into the space-separated args field, quoting entries with spaces. */
+function formatArgs(args: string[]): string {
+  return args.map(arg => (/\s/.test(arg) ? `"${arg}"` : arg)).join(' ')
+}
+
+/** Seed the edit form from an existing row; the Bearer token is never returned, so it stays blank. */
+function draftFromServer(server: McpServerView): ServerDraft {
+  const authMode = server.authMode === 'bearer' || server.authMode === 'headers' ? server.authMode : 'none'
+  return {
+    type: server.type,
+    name: server.name,
+    url: server.url ?? '',
+    authMode,
+    token: '',
+    headersText: Object.keys(server.headers ?? {}).length > 0 ? JSON.stringify(server.headers, null, 2) : '',
+    command: server.command ?? '',
+    args: formatArgs(server.args ?? []),
+    envText: Object.keys(server.env ?? {}).length > 0 ? JSON.stringify(server.env, null, 2) : '',
+    cwd: server.cwd ?? '',
+  }
+}
+
+/** Convert a draft into the create/update payload; a blank token is omitted so an edit keeps it. */
+function draftToPayload(draft: ServerDraft): Record<string, unknown> {
+  const payload: Record<string, unknown> = {
+    name: draft.name.trim(),
+    type: draft.type,
+  }
+  if (draft.type === 'stdio') {
+    payload.command = draft.command.trim()
+    payload.args = draft.args
+    payload.env = parseRecord(draft.envText)
+    if (draft.cwd.trim() !== '') payload.cwd = draft.cwd.trim()
+  } else {
+    payload.url = draft.url.trim()
+    payload.authMode = draft.authMode
+    if (draft.authMode === 'bearer' && draft.token !== '') payload.token = draft.token
+    if (draft.authMode === 'headers') payload.headers = parseRecord(draft.headersText)
+  }
+  return payload
+}
+
+/** Server-list row: name, endpoint, status, actions; switches into the edit form in place. */
 function ServerRow({
   server,
   onRefresh,
@@ -301,13 +365,14 @@ function ServerRow({
 }: {
   server: McpServerView
   onRefresh: () => void
-  actions: Pick<McpCenterSectionInjected, 'removeServer' | 'toggleServer' | 'reconnectServer'>
+  actions: Pick<McpCenterSectionInjected, 'removeServer' | 'toggleServer' | 'reconnectServer' | 'updateServer'>
   t: McpCenterTranslate
 }): ReactNode {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [tokenInput, setTokenInput] = useState('')
   const [showToken, setShowToken] = useState(false)
+  const [editing, setEditing] = useState(false)
 
   const run = async (op: () => Promise<void>): Promise<void> => {
     setBusy(true)
@@ -325,6 +390,26 @@ function ServerRow({
   const endpoint = server.type === 'stdio'
     ? `stdio · ${server.command ?? ''} ${(server.args ?? []).join(' ')}`
     : `${authLabel} · ${server.url ?? ''}`
+
+  if (editing) {
+    return (
+      <li>
+        <ServerForm
+          initial={draftFromServer(server)}
+          tokenPlaceholder={server.hasToken ? t('tokenKeep') : ''}
+          submitLabel={t('saveChanges')}
+          busyLabel={t('saving')}
+          onSubmit={async (payload) => {
+            await actions.updateServer(server.id, payload)
+            setEditing(false)
+            onRefresh()
+          }}
+          onCancel={() => { setEditing(false) }}
+          t={t}
+        />
+      </li>
+    )
+  }
 
   return (
     <li style={style.card}>
@@ -374,6 +459,14 @@ function ServerRow({
         ) : null}
       </div>
       <div style={style.actions}>
+        <button
+          type="button"
+          style={style.button}
+          disabled={busy}
+          onClick={() => { setEditing(true) }}
+        >
+          {t('edit')}
+        </button>
         {server.type === 'http' && server.authMode === 'bearer'
           ? (
             <button
@@ -410,63 +503,53 @@ function ServerRow({
 }
 
 /**
- * Add form. Local state only; submit calls the inject face's addServer.
+ * Shared add/edit form. Local state only; `onSubmit` receives the validated
+ * payload and may throw (its message is shown inline). The token field is
+ * write-only: on edit it starts blank, and blank keeps the stored token.
  */
-function AddForm({
-  onAdded,
-  actions,
+function ServerForm({
+  initial,
+  tokenPlaceholder = '',
+  submitLabel,
+  busyLabel,
+  onSubmit,
+  onCancel,
   t,
 }: {
-  onAdded: () => void
-  actions: Pick<McpCenterSectionInjected, 'addServer'>
+  initial: ServerDraft
+  tokenPlaceholder?: string
+  submitLabel: string
+  busyLabel: string
+  onSubmit: (payload: Record<string, unknown>) => Promise<void>
+  onCancel: () => void
   t: McpCenterTranslate
 }): ReactNode {
-  const [open, setOpen] = useState(false)
-  const [draft, setDraft] = useState<AddDraft>(freshDraft)
+  const [draft, setDraft] = useState<ServerDraft>(initial)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
 
-  const set = (patch: Partial<AddDraft>): void => setDraft(previous => ({ ...previous, ...patch }))
+  const set = (patch: Partial<ServerDraft>): void => setDraft(previous => ({ ...previous, ...patch }))
 
-  const nameValid = /^[A-Za-z0-9_-]{1,32}$/.test(draft.name)
-  const valid = nameValid && (draft.type === 'stdio' ? draft.command.trim() !== '' : /^https?:\/\//.test(draft.url))
+  const nameValid = NAME_PATTERN.test(draft.name)
+  const envValid = isRecordText(draft.envText)
+  const headersValid = isRecordText(draft.headersText)
+  const valid = nameValid
+    && (draft.type === 'stdio'
+      ? draft.command.trim() !== '' && envValid
+      : /^https?:\/\//.test(draft.url) && headersValid)
 
   const submit = async (): Promise<void> => {
-    if (busy) return
+    if (busy || !valid) return
     setError('')
     setBusy(true)
     try {
-      const payload: Record<string, unknown> = {
-        name: draft.name.trim(),
-        type: draft.type,
-      }
-      if (draft.type === 'stdio') {
-        payload.command = draft.command.trim()
-        payload.args = draft.args
-        payload.env = parseRecord(draft.envText)
-        if (draft.cwd.trim() !== '') payload.cwd = draft.cwd.trim()
-      } else {
-        payload.url = draft.url.trim()
-        payload.authMode = draft.authMode
-        if (draft.authMode === 'bearer') payload.token = draft.token
-        if (draft.authMode === 'headers') payload.headers = parseRecord(draft.headersText)
-      }
-      await actions.addServer(payload)
-      setDraft(freshDraft())
-      setOpen(false)
-      onAdded()
+      await onSubmit(draftToPayload(draft))
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
+      setBusy(false)
+      return
     }
     setBusy(false)
-  }
-
-  if (!open) {
-    return (
-      <button type="button" style={style.primaryButton} onClick={() => { setOpen(true) }}>
-        + {t('addServer')}
-      </button>
-    )
   }
 
   return (
@@ -531,6 +614,7 @@ function AddForm({
               placeholder={t('envPlaceholder')}
               onChange={(event) => set({ envText: event.target.value })}
             />
+            {!envValid ? <p style={style.error} role="alert">{t('jsonInvalid')}</p> : null}
           </div>
         </>
       ) : (
@@ -563,6 +647,7 @@ function AddForm({
                 style={style.input}
                 value={draft.token}
                 spellCheck={false}
+                placeholder={tokenPlaceholder}
                 onChange={(event) => set({ token: event.target.value })}
               />
             </div>
@@ -577,6 +662,7 @@ function AddForm({
                 spellCheck={false}
                 onChange={(event) => set({ headersText: event.target.value })}
               />
+              {!headersValid ? <p style={style.error} role="alert">{t('jsonInvalid')}</p> : null}
             </div>
           ) : null}
         </>
@@ -588,7 +674,7 @@ function AddForm({
       {error !== '' ? <p style={style.error} role="alert">{error}</p> : null}
 
       <div style={style.formActions}>
-        <button type="button" style={style.button} onClick={() => { setOpen(false) }} disabled={busy}>
+        <button type="button" style={style.button} onClick={onCancel} disabled={busy}>
           {t('cancel')}
         </button>
         <button
@@ -597,10 +683,48 @@ function AddForm({
           disabled={!valid || busy}
           onClick={() => { void submit() }}
         >
-          {busy ? t('saving') : t('save')}
+          {busy ? busyLabel : submitLabel}
         </button>
       </div>
     </div>
+  )
+}
+
+/**
+ * Add form: a collapsed button that expands into the shared {@link ServerForm}.
+ */
+function AddForm({
+  onAdded,
+  actions,
+  t,
+}: {
+  onAdded: () => void
+  actions: Pick<McpCenterSectionInjected, 'addServer'>
+  t: McpCenterTranslate
+}): ReactNode {
+  const [open, setOpen] = useState(false)
+
+  if (!open) {
+    return (
+      <button type="button" style={style.primaryButton} onClick={() => { setOpen(true) }}>
+        + {t('addServer')}
+      </button>
+    )
+  }
+
+  return (
+    <ServerForm
+      initial={freshDraft()}
+      submitLabel={t('save')}
+      busyLabel={t('saving')}
+      onSubmit={async (payload) => {
+        await actions.addServer(payload)
+        setOpen(false)
+        onAdded()
+      }}
+      onCancel={() => { setOpen(false) }}
+      t={t}
+    />
   )
 }
 
@@ -610,7 +734,7 @@ function AddForm({
  * @returns the section.
  */
 export function McpCenterSection(props: McpCenterSectionProps): ReactNode {
-  const { loadServers, removeServer, toggleServer, reconnectServer, addServer, t } = props
+  const { loadServers, removeServer, toggleServer, reconnectServer, addServer, updateServer, t } = props
   const [servers, setServers] = useState<McpServerView[]>([])
   const timerRef = useRef<number | null>(null)
 
@@ -627,7 +751,7 @@ export function McpCenterSection(props: McpCenterSectionProps): ReactNode {
     }
   }, [loadServers])
 
-  const actions = { removeServer, toggleServer, reconnectServer }
+  const actions = { removeServer, toggleServer, reconnectServer, updateServer }
 
   return (
     <div style={style.section}>

@@ -7,7 +7,11 @@
  * server immediately — saving IS the wire, no settings-service RPC involved.
  */
 
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
+// Type-only: the browser context is a Cordis context after declaration merging
+// (the client runtime's own `ClientContext` is an alias of this exact type).
+import type { Context } from '@deepseek-ai/cordis'
+// Type-only: pulls ctx.slots (the ui-renderer slot registry service).
+import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 // Type-only: pulls the settings shell's SlotMap merge (the 'settings.section' entry).
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 // Type-only: pulls the slot type chain and the locale namespace merge.
@@ -39,7 +43,7 @@ export const inject = ['slots', 'locale']
  * Mount the Settings page.
  * @param ctx - the browser plugin context.
  */
-export function apply(ctx: ClientContext): void {
+export function apply(ctx: Context): void {
   // Theme-plugin style nav override: the settings shell hardcodes nav icons by
   // section id and offers no icon option on settings.section, so swap the
   // MCP Center row's gear glyph for the link icon via DOM observation. The
